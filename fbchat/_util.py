@@ -1,94 +1,222 @@
-import datetime
+# -*- coding: UTF-8 -*-
+
+from __future__ import unicode_literals
+import re
 import json
-import time
-import random
-import urllib.parse
+from time import time
+from random import random
+from contextlib import contextmanager
+from mimetypes import guess_type
+from os.path import basename
+import warnings
+import logging
+import requests
+from ._exception import (
+    FBchatException,
+    FBchatFacebookError,
+    FBchatInvalidParameters,
+    FBchatNotLoggedIn,
+    FBchatPleaseRefresh,
+)
 
-from ._common import log
-from . import _exception
+try:
+    from urllib.parse import urlencode, parse_qs, urlparse
 
-from typing import Iterable, Optional, Any, Mapping, Sequence
+    basestring = (str, bytes)
+except ImportError:
+    from urllib import urlencode
+    from urlparse import parse_qs, urlparse
+
+    basestring = basestring
+
+# Python 2's `input` executes the input, whereas `raw_input` just returns the input
+try:
+    input = raw_input
+except NameError:
+    pass
+
+# Log settings
+log = logging.getLogger("client")
+log.setLevel(logging.DEBUG)
+# Creates the console handler
+handler = logging.StreamHandler()
+log.addHandler(handler)
+
+#: Default list of user agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/601.1.10 (KHTML, like Gecko) Version/8.0.5 Safari/601.1.10",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; ; NCT50_AAP285C84A1328) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.1 (KHTML, like Gecko) Chrome/22.0.1207.1 Safari/537.1",
+    "Mozilla/5.0 (X11; CrOS i686 2268.111.0) AppleWebKit/536.11 (KHTML, like Gecko) Chrome/20.0.1132.57 Safari/536.11",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/536.6 (KHTML, like Gecko) Chrome/20.0.1092.0 Safari/536.6",
+]
 
 
-def int_or_none(inp: Any) -> Optional[int]:
-    try:
-        return int(inp)
-    except Exception:
-        return None
+def now():
+    return int(time() * 1000)
 
 
-def get_limits(limit: Optional[int], max_limit: int) -> Iterable[int]:
-    """Helper that generates limits based on a max limit."""
-    if limit is None:
-        # Generate infinite items
-        while True:
-            yield max_limit
-
-    if limit < 0:
-        raise ValueError("Limit cannot be negative")
-
-    # Generate n items
-    yield from [max_limit] * (limit // max_limit)
-
-    remainder = limit % max_limit
-    if remainder:
-        yield remainder
-
-
-def json_minimal(data: Any) -> str:
+def json_minimal(data):
     """Get JSON data in minimal form."""
     return json.dumps(data, separators=(",", ":"))
 
 
-def strip_json_cruft(text: str) -> str:
+def strip_json_cruft(text):
     """Removes `for(;;);` (and other cruft) that preceeds JSON responses."""
     try:
         return text[text.index("{") :]
-    except ValueError as e:
-        raise _exception.ParseError("No JSON object found", data=text) from e
+    except ValueError:
+        raise FBchatException("No JSON object found: {!r}".format(text))
 
 
-def parse_json(text: str) -> Any:
+def get_cookie_header(session, url):
+    """Extract a cookie header from a requests session."""
+    # The cookies are extracted this way to make sure they're escaped correctly
+    return requests.cookies.get_cookie_header(
+        session.cookies, requests.Request("GET", url),
+    )
+
+
+def get_decoded_r(r):
+    return get_decoded(r._content)
+
+
+def get_decoded(content):
+    return content.decode("utf-8")
+
+
+def parse_json(content):
     try:
-        return json.loads(text)
-    except ValueError as e:
-        raise _exception.ParseError("Error while parsing JSON", data=text) from e
+        return json.loads(content)
+    except ValueError:
+        raise FBchatFacebookError("Error while parsing JSON: {!r}".format(content))
 
 
-def generate_offline_threading_id():
-    ret = datetime_to_millis(datetime.datetime.utcnow())
-    value = int(random.random() * 4294967295)
+def digitToChar(digit):
+    if digit < 10:
+        return str(digit)
+    return chr(ord("a") + digit - 10)
+
+
+def str_base(number, base):
+    if number < 0:
+        return "-" + str_base(-number, base)
+    (d, m) = divmod(number, base)
+    if d > 0:
+        return str_base(d, base) + digitToChar(m)
+    return digitToChar(m)
+
+
+def generateMessageID(client_id=None):
+    k = now()
+    l = int(random() * 4294967295)
+    return "<{}:{}-{}@mail.projektitan.com>".format(k, l, client_id)
+
+
+def getSignatureID():
+    return hex(int(random() * 2147483648))
+
+
+def generateOfflineThreadingID():
+    ret = now()
+    value = int(random() * 4294967295)
     string = ("0000000000000000000000" + format(value, "b"))[-22:]
     msgs = format(ret, "b") + string
     return str(int(msgs, 2))
 
 
-def remove_version_from_module(module):
-    return module.split("@", 1)[0]
+def handle_payload_error(j):
+    if "error" not in j:
+        return
+    error = j["error"]
+    if j["error"] == 1357001:
+        error_cls = FBchatNotLoggedIn
+    elif j["error"] == 1357004:
+        error_cls = FBchatPleaseRefresh
+    elif j["error"] in (1357031, 1545010, 1545003):
+        error_cls = FBchatInvalidParameters
+    else:
+        error_cls = FBchatFacebookError
+    # TODO: Use j["errorSummary"]
+    # "errorDescription" is in the users own language!
+    raise error_cls(
+        "Error #{} when sending request: {}".format(error, j["errorDescription"]),
+        fb_error_code=error,
+        fb_error_message=j["errorDescription"],
+    )
 
 
-def get_jsmods_require(require) -> Mapping[str, Sequence[Any]]:
-    rtn = {}
-    for item in require:
-        if len(item) == 1:
-            (module,) = item
-            rtn[remove_version_from_module(module)] = []
-            continue
-        module, method, requirements, arguments = item
-        method = "{}.{}".format(remove_version_from_module(module), method)
-        rtn[method] = arguments
-    return rtn
+def handle_graphql_errors(j):
+    errors = []
+    if j.get("error"):
+        errors = [j["error"]]
+    if "errors" in j:
+        errors = j["errors"]
+    if errors:
+        error = errors[0]  # TODO: Handle multiple errors
+        # TODO: Use `summary`, `severity` and `description`
+        raise FBchatFacebookError(
+            "GraphQL error #{}: {} / {!r}".format(
+                error.get("code"), error.get("message"), error.get("debug_info")
+            ),
+            fb_error_code=error.get("code"),
+            fb_error_message=error.get("message"),
+        )
 
 
-def get_jsmods_define(define) -> Mapping[str, Mapping[str, Any]]:
-    rtn = {}
-    for item in define:
-        module, requirements, data, _ = item
-        rtn[module] = data
-    return rtn
+def check_request(r):
+    check_http_code(r.status_code)
+    content = get_decoded_r(r)
+    check_content(content)
+    return content
 
 
-def mimetype_to_key(mimetype: str) -> str:
+def check_http_code(code):
+    msg = "Error when sending request: Got {} response.".format(code)
+    if code == 404:
+        raise FBchatFacebookError(
+            msg + " This is either because you specified an invalid URL, or because"
+            " you provided an invalid id (Facebook usually requires integer ids).",
+            request_status_code=code,
+        )
+    if 400 <= code < 600:
+        raise FBchatFacebookError(msg, request_status_code=code)
+
+
+def check_content(content, as_json=True):
+    if content is None or len(content) == 0:
+        raise FBchatFacebookError("Error when sending request: Got empty response")
+
+
+def to_json(content):
+    content = strip_json_cruft(content)
+    j = parse_json(content)
+    log.debug(j)
+    return j
+
+
+# def get_jsmods_require(j, index):
+#     if j.get("jsmods") and j["jsmods"].get("require"):
+#         try:
+#             return j["jsmods"]["require"][0][index][0]
+#         except (KeyError, IndexError) as e:
+#             return None
+#             # log.(
+#             #     "Error when getting jsmods_require: "
+#             #     "{}. Facebook might have changed protocol".format(j)
+#             # )
+#     return None
+
+
+def require_list(list_):
+    if isinstance(list_, list):
+        return set(list_)
+    else:
+        return set([list_])
+
+
+def mimetype_to_key(mimetype):
     if not mimetype:
         return "file_id"
     if mimetype == "image/gif":
@@ -99,62 +227,45 @@ def mimetype_to_key(mimetype: str) -> str:
     return "file_id"
 
 
-def get_url_parameter(url: str, param: str) -> Optional[str]:
-    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    if not params.get(param):
-        return None
-    return params[param][0]
+def get_files_from_urls(file_urls):
+    files = []
+    for file_url in file_urls:
+        r = requests.get(file_url)
+        # We could possibly use r.headers.get('Content-Disposition'), see
+        # https://stackoverflow.com/a/37060758
+        file_name = basename(file_url).split("?")[0].split("#")[0]
+        files.append(
+            (
+                file_name,
+                r.content,
+                r.headers.get("Content-Type") or guess_type(file_name)[0],
+            )
+        )
+    return files
 
 
-def seconds_to_datetime(timestamp_in_seconds: float) -> datetime.datetime:
-    """Convert an UTC timestamp to a timezone-aware datetime object."""
-    # `.utcfromtimestamp` will return a "naive" datetime object, which is why we use the
-    # following:
-    return datetime.datetime.fromtimestamp(
-        timestamp_in_seconds, tz=datetime.timezone.utc
-    )
+@contextmanager
+def get_files_from_paths(filenames):
+    files = []
+    for filename in filenames:
+        files.append(
+            (basename(filename), open(filename, "rb"), guess_type(filename)[0])
+        )
+    yield files
+    for fn, fp, ft in files:
+        fp.close()
 
 
-def millis_to_datetime(timestamp_in_milliseconds: int) -> datetime.datetime:
-    """Convert an UTC timestamp, in milliseconds, to a timezone-aware datetime."""
-    return seconds_to_datetime(timestamp_in_milliseconds / 1000)
+def get_url_parameters(url, *args):
+    params = parse_qs(urlparse(url).query)
+    return [params[arg][0] for arg in args if params.get(arg)]
 
 
-def datetime_to_seconds(dt: datetime.datetime) -> int:
-    """Convert a datetime to an UTC timestamp.
-
-    Naive datetime objects are presumed to represent time in the system timezone.
-
-    The returned seconds will be rounded to the nearest whole number.
-    """
-    # We could've implemented some fancy "convert naive timezones to UTC" logic, but
-    # it's not really worth the effort.
-    return round(dt.timestamp())
+def get_url_parameter(url, param):
+    return get_url_parameters(url, param)[0]
 
 
-def datetime_to_millis(dt: datetime.datetime) -> int:
-    """Convert a datetime to an UTC timestamp, in milliseconds.
-
-    Naive datetime objects are presumed to represent time in the system timezone.
-
-    The returned milliseconds will be rounded to the nearest whole number.
-    """
-    return round(dt.timestamp() * 1000)
-
-
-def seconds_to_timedelta(seconds: float) -> datetime.timedelta:
-    """Convert seconds to a timedelta."""
-    return datetime.timedelta(seconds=seconds)
-
-
-def millis_to_timedelta(milliseconds: int) -> datetime.timedelta:
-    """Convert a duration (in milliseconds) to a timedelta object."""
-    return datetime.timedelta(milliseconds=milliseconds)
-
-
-def timedelta_to_seconds(td: datetime.timedelta) -> int:
-    """Convert a timedelta to seconds.
-
-    The returned seconds will be rounded to the nearest whole number.
-    """
-    return round(td.total_seconds())
+def prefix_url(url):
+    if url.startswith("/"):
+        return "https://www.facebook.com" + url
+    return url
